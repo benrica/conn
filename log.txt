@@ -1,0 +1,28 @@
+[I] [2018-06-29 08:49:36 PM] [7093] 连接数据库成功,dburl:[student@orcl].
+[I] [2018-06-29 08:49:36 PM] [7093] ORACLE初始化预编译环境完成..
+[I] [2018-06-29 08:49:44 PM] [7093] Exec_cmd[ h ]..
+[I] [2018-06-29 08:50:02 PM] [7093] Call_sql:select * from grade_type
+[I] [2018-06-29 08:50:30 PM] [7093] Call_sql:select count(*) from grade
+[I] [2018-06-29 08:51:03 PM] [7093] Exec_cmd[ unload to grade.txt select * from grade.txt ]..
+[E] [2018-06-29 08:51:03 PM] [7093] DBD::Oracle::db prepare failed: ORA-00942: table or view does not exist (DBD ERROR: error possibly near <*> indicator at char 20 in 'select * from grade.<*>txt') at ./conn line 939, <STDIN> line 4.
+
+[I] [2018-06-29 08:51:25 PM] [7093] Exec_cmd[ unload to grade.txt select * from grade ]..
+[I] [2018-06-29 08:51:25 PM] [7093] write  out: 2004 line.
+[I] [2018-06-29 08:51:25 PM] [7093] 导出文件:grade.txt 大小:0.141M 耗时:0.02649s 共[ 2004 ]条记录 效率:75651/s 
+[I] [2018-06-29 08:51:41 PM] [7093] Exec_cmd[ !head grade.txt ]..
+[I] [2018-06-29 08:51:56 PM] [7093] Exec_cmd[ desc grade ]..
+[I] [2018-06-29 08:52:22 PM] [7093] Call_sql:create table grade_new as select * from grade where 1=2
+[I] [2018-06-29 08:52:24 PM] [7093] Create Success..
+[I] [2018-06-29 08:53:13 PM] [7093] Exec_cmd[ load from grade.txt insert into grade_new ]..
+[I] [2018-06-29 08:53:13 PM] [7093] 封装处理后SQL:insert into grade_new values(?,?,?,?,?,?,?,?,?,?)
+[I] [2018-06-29 08:53:14 PM] [7093] 导入[1000]行数据,休眠0.2秒后继续..
+[I] [2018-06-29 08:53:14 PM] [7093] 导入[2000]行数据,休眠0.2秒后继续..
+[I] [2018-06-29 08:53:14 PM] [7093] 数据装载完成,共[2004]条数据,耗时:0.47541s
+[I] [2018-06-29 08:53:41 PM] [7093] Call_sql:select * from grade_new where rownum<3
+[I] [2018-06-29 08:53:53 PM] [7093] Call_sql:select count(*) from grade_new
+[I] [2018-06-29 08:55:46 PM] [7093] Exec_cmd[ gg grade ]..
+[I] [2018-06-29 08:56:37 PM] [7093] Exec_cmd[ ll ]..
+[I] [2018-06-29 08:57:07 PM] [7093] Exec_cmd[ !ifconfig ]..
+[I] [2018-06-29 08:58:21 PM] [7093] Exec_cmd[ q ]..
+[I] [2018-06-29 08:58:21 PM] [7093] Rollback for the end!
+[I] [2018-06-29 08:58:21 PM] [7093] 压缩[ 7 ]天前日志文件完成..
