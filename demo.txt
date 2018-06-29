@@ -1,0 +1,221 @@
+[root@slave _chic]# ./conn orcl student@orcl
+
+→提醒:您正使用个性化配置文件[/root/dbi_cfg]认证登录,帐号/密码如有变更请vi编辑.
+   ################### 提示 ###################
+   # 欢迎使用BI侧数据库工具:conn
+   # 当前为交互模式,help获取帮助,q退出交互模式
+   # 作者:damoen@qq.com   版本:1.0
+   ############################################
+
+student@orcl> h
+
+---导出导入---
+unload to filename select * from table
+<load|iload|rload|aload|tload> from filename insert into tab_name
+<load|iload|rload|aload|tload> from filename insert into tab_name(a, b)
+
+load模式说明如下
+
+rload : replace  load 模式
+aload : append   load 模式
+tload : truncate load 模式
+iload : insert   load 模式
+load  : 同insert
+
+---快捷操作--
+l       :列出所有SQL历史命令
+ll      :列出后10条SQL历史命令
+/       :再次执行当前命令
+/ [seq] :执行第seq条命令
+gg key  :库表搜索
+dic dict:NGCRM字典查询
+dig gid :NGCRM字典组查询
+p num   :指定oracle并行度为num
+po      :关闭oracle并行,即parallel off
+unix命令:!加shell命令或脚本,如输入[!ls]显示当前目录下的文件
+
+xplan sql            :查看sql的执行计划
+remark ams           :指定执行SQL时的备注信息为ams
+set colsep str       :指定导入字段分隔符为 str
+set pagesize num     :指定分页大小
+q|quit|bye|exit      :退出
+diff table_a table_b :数据差异核对综合分析器
+
+说明：
+单行输入模式 → 1.SQL语句以分号结尾 2.非SQL语句无需加分号
+多行输入模式 → 以分号分隔命令行（SQL或是内置命令或UNIX命令）
+
+student@orcl> select * from grade_type;
+
+ GRADE_TYPE_CODE DESCRIPTION   CREATED_BY CREATED_DATE        MODIFIED_BY MODIFIED_DATE
+ --------------- ------------- ---------- ------------------- ----------- -------------
+ FI              Final         MCAFFREY   1998-12-31 00:00:00 MCAFFREY    1998-12-31 00:00:00
+ HM              Homework      MCAFFREY   1998-12-31 00:00:00 MCAFFREY    1998-12-31 00:00:00
+ MT              Midterm       MCAFFREY   1998-12-31 00:00:00 MCAFFREY    1998-12-31 00:00:00
+ PA              Participation MCAFFREY   1998-12-31 00:00:00 MCAFFREY    1998-12-31 00:00:00
+ PJ              Project       MCAFFREY   1998-12-31 00:00:00 MCAFFREY    1998-12-31 00:00:00
+ QZ              Quiz          MCAFFREY   1998-12-31 00:00:00 MCAFFREY    1998-12-31 00:00:00
+
+ 6 row selected. Elapsed: 0.00521s
+student@orcl> select count(*) from grade;        
+
+ COUNT(*)
+ --------
+ 2004    
+
+ 1 row selected. Elapsed: 0.02047s
+student@orcl> unload to grade.txt select * from grade.txt;
+DBD::Oracle::db prepare failed: ORA-00942: table or view does not exist (DBD ERROR: error possibly near <*> indicator at char 20 in 'select * from grade.<*>txt') at ./conn line 939, <STDIN> line 4.
+student@orcl> unload to grade.txt select * from grade;
+start Time: 2018-06-29 20:51:25
+write  out: 2004 line.
+end Time: 2018-06-29 20:51:25
+导出文件:grade.txt 大小:0.141M 耗时:0.02649s 共[ 2004 ]条记录 效率:75651/s 
+student@orcl> !head grade.txt
+102|86|FI|1|85||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+102|86|HM|1|90||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+102|86|HM|2|99||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+102|86|HM|3|82||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+102|86|HM|4|82||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+102|86|MT|1|90||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+102|86|PA|1|85||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+102|86|QZ|1|90||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+102|86|QZ|2|84||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+102|86|QZ|3|97||CBRENNAN|2007-02-11 00:00:00|JAYCAF|2007-02-11 00:00:00
+student@orcl> 
+student@orcl> 
+student@orcl> desc grade;
+
+ Name                  Type           Null     Index
+ --------------------- -------------- -------- -----
+ STUDENT_ID            NUMBER(8)      NOT NULL Y    
+ SECTION_ID            NUMBER(8)      NOT NULL Y    
+ GRADE_TYPE_CODE       CHAR(2)        NOT NULL Y    
+ GRADE_CODE_OCCURRENCE NUMBER(38)     NOT NULL Y    
+ NUMERIC_GRADE         NUMBER(3)      NOT NULL      
+ COMMENTS              VARCHAR2(2000)               
+ CREATED_BY            VARCHAR2(30)   NOT NULL      
+ CREATED_DATE          DATE           NOT NULL      
+ MODIFIED_BY           VARCHAR2(30)   NOT NULL      
+ MODIFIED_DATE         DATE           NOT NULL      
+
+student@orcl> create table grade_new as select * from grade where 1=2;
+Create Success..
+student@orcl> load from grade.txt insert into grade_new;
+导入[1000]行数据,休眠0.2秒后继续..
+导入[2000]行数据,休眠0.2秒后继续..
+
+→数据装载完成,共[2004]条数据,耗时:0.47541s
+student@orcl> select * from grade_new where rownum<3;
+
+ STUDENT_ID SECTION_ID GRADE_TYPE_CODE GRADE_CODE_OCCURRENCE NUMERIC_GRADE COMMENTS CREATED_BY CREATED_DATE        MODIFIED_BY MODIFIED_DATE
+ ---------- ---------- --------------- --------------------- ------------- -------- ---------- ------------------- ----------- -------------
+ 111        133        PA              6                     80                     CBRENNAN   2007-02-11 00:00:00 JAYCAF      2007-02-11 00:00:00
+ 134        102        HM              3                     99                     CBRENNAN   2007-02-11 00:00:00 JAYCAF      2007-02-11 00:00:00
+
+ 2 row selected. Elapsed: 0.00375s
+student@orcl> select count(*) from grade_new;
+
+ COUNT(*)
+ --------
+ 2004    
+
+ 1 row selected. Elapsed: 0.00392s
+student@orcl> xplan      SELECT c.course_no, c.description,
+            s.section_id, s.course_no
+       FROM course c LEFT OUTER JOIN section s
+         ON c.course_no = s.course_no
+      ORDER BY c.course_no
+;
+
+ PLAN_TABLE_OUTPUT
+ -----------------
+ Plan hash value: 3028493820
+                  
+ -------------------------------------------------------------------------------------------------
+ | Id  | Operation                    | Name             | Rows  | Bytes | Cost (%CPU)| Time     |
+ -------------------------------------------------------------------------------------------------
+ |   0 | SELECT STATEMENT             |                  |    78 |  2574 |     6  (34)| 00:00:01 |
+ |   1 |  MERGE JOIN OUTER            |                  |    78 |  2574 |     6  (34)| 00:00:01 |
+ |   2 |   TABLE ACCESS BY INDEX ROWID| COURSE           |    30 |   750 |     2   (0)| 00:00:01 |
+ |   3 |    INDEX FULL SCAN           | CRSE_PK          |    30 |       |     1   (0)| 00:00:01 |
+ |*  4 |   SORT JOIN                  |                  |    78 |   624 |     4  (50)| 00:00:01 |
+ |   5 |    VIEW                      | index$_join$_002 |    78 |   624 |     3  (34)| 00:00:01 |
+ |*  6 |     HASH JOIN                |                  |       |       |            |          |
+ |   7 |      INDEX FAST FULL SCAN    | SECT_CRSE_FK_I   |    78 |   624 |     1   (0)| 00:00:01 |
+ |   8 |      INDEX FAST FULL SCAN    | SECT_PK          |    78 |   624 |     1   (0)| 00:00:01 |
+ -------------------------------------------------------------------------------------------------
+                  
+ Predicate Information (identified by operation id):
+ ---------------------------------------------------
+                  
+    4 - access("C"."COURSE_NO"="S"."COURSE_NO"(+))
+        filter("C"."COURSE_NO"="S"."COURSE_NO"(+))
+    6 - access(ROWID=ROWID)
+student@orcl> student@orcl> 
+student@orcl> gg grade
+
+ OWNER       TABLE_NAME                TABLESPACE_NAME NUM_ROWS
+ ----------- ------------------------- --------------- --------
+ APEX_030200 WWV_FLOW_UPGRADE_PROGRESS SYSAUX          89      
+ SCOTT       SALGRADE                  USERS           5       
+ STUDENT     GRADE                     USERS           2004    
+ STUDENT     GRADE_CONVERSION          USERS           15      
+ STUDENT     GRADE_TYPE                USERS           6       
+ STUDENT     GRADE_TYPE_WEIGHT         USERS           300     
+
+ 6 row selected. Elapsed: 0.32353s
+
+→请选择用户名和表名(以空格分隔):STUDENT GRADE_TYPE_WEIGHT
+
+→Table_Name:STUDENT.GRADE_TYPE_WEIGHT
+
+                   COL  VAL                     TYPE          CONS  IND  NULL
+            SECTION_ID: 79                     |NUMBER(8)    |C,P,R |Y   |NOT NULL
+       GRADE_TYPE_CODE: FI                     |CHAR(2)      |C,P,R |Y   |NOT NULL
+    NUMBER_PER_SECTION: 1                      |NUMBER(3)    |C    |    |NOT NULL
+PERCENT_OF_FINAL_GRADE: 25                     |NUMBER(3)    |C    |    |NOT NULL
+           DROP_LOWEST: N                      |CHAR(1)      |C    |    |NOT NULL
+            CREATED_BY: CBRENNAN               |VARCHAR2(30) |C    |    |NOT NULL
+          CREATED_DATE: 2007-01-04 00:00:00    |DATE         |C    |    |NOT NULL
+           MODIFIED_BY: CBRENNAN               |VARCHAR2(30) |C    |    |NOT NULL
+         MODIFIED_DATE: 2007-01-05 00:00:00    |DATE         |C    |    |NOT NULL
+
+→库表[STUDENT.GRADE_TYPE_WEIGHT]主键字段[SECTION_ID GRADE_TYPE_CODE]
+→库表[STUDENT.GRADE_TYPE_WEIGHT]索引字段[SECTION_ID GRADE_TYPE_CODE]
+student@orcl> 
+student@orcl> ll
+→倒数第[6]条: select * from grade_type;
+→倒数第[5]条: select count(*) from grade;
+→倒数第[4]条: create table grade_new as select * from grade where 1=2;
+→倒数第[3]条: select * from grade_new where rownum<3;
+→倒数第[2]条: select count(*) from grade_new;
+→倒数第[1]条: xplan      SELECT c.course_no, c.description,
+s.section_id, s.course_no
+       FROM course c LEFT OUTER JOIN section s
+         ON c.course_no = s.course_no
+      ORDER BY c.course_no
+
+student@orcl> !ifconfig 
+eth0      Link encap:Ethernet  HWaddr 00:0C:29:41:F3:28  
+          inet addr:192.168.3.9  Bcast:192.168.3.255  Mask:255.255.255.0
+          inet6 addr: fe80::20c:29ff:fe41:f328/64 Scope:Link
+          UP BROADCAST RUNNING MULTICAST  MTU:1500  Metric:1
+          RX packets:498983 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:450946 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 txqueuelen:1000 
+          RX bytes:233768098 (222.9 MiB)  TX bytes:344386874 (328.4 MiB)
+
+lo        Link encap:Local Loopback  
+          inet addr:127.0.0.1  Mask:255.0.0.0
+          inet6 addr: ::1/128 Scope:Host
+          UP LOOPBACK RUNNING  MTU:16436  Metric:1
+          RX packets:511638 errors:0 dropped:0 overruns:0 frame:0
+          TX packets:511638 errors:0 dropped:0 overruns:0 carrier:0
+          collisions:0 txqueuelen:0 
+          RX bytes:138016507 (131.6 MiB)  TX bytes:138016507 (131.6 MiB)
+
+student@orcl>
+student@orcl> q
+
+quit! Time: 2018-06-29 20:58:21
