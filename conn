@@ -1,0 +1,1576 @@
+#!/usr/bin/perl
+##create by damon at 20150306
+##Email:damoen@qq.com
+use strict;
+use DBI;
+no strict 'refs';
+use Time::HiRes qw/time/;
+use POSIX qw/strftime/;
+use Getopt::Std;
+use MIME::Base64;
+#binmode STDIN, ':utf8'; 
+#binmode STDOUT, ':utf8'; 
+
+my %opts=();
+getopts("d:f:hp",\%opts);
+my $version = '1.0';
+my $tool_dir = "$ENV{HOME}/bin";
+my $inner_flag = 0;
+my $tag = '→';
+my $tool_name = (split /\//,$0)[-1];
+my $tool_dir  = (split /$tool_name/,$0)[0];
+my %attr =( "RaiseError" => 1,"PrintError" => 0, "AutoCommit" => 0);
+#my $cfg_dir = $ENV{USER} =~ /linfr/i ? $tool_dir : $ENV{HOME};
+my $cfg_dir = $ENV{HOME};
+$cfg_dir =~ s/\/$//;
+my $cfg_file = $opts{'c'} ? $opts{'c'} : ($cfg_dir ? "$cfg_dir/dbi_cfg" : "dbi_cfg");
+my (%all_dbh,%pre_sth,$dbh,@history,$interrupt);
+my $rows_num = 100;
+my $chk_sen = 0;
+my $idx = 0;
+my $notes;
+my $warn = "\033[5;7mWarning\033[0m";
+my $sep = '|';
+my $pagesize = 10;
+
+sub init_tt{}
+sub init_db2{}
+sub init_mysql{}
+#my %dbtype = map{$_,1} qw/ora tt db2 mysql/;
+my %init_db = ('ora' => \&init_ora,'tt' => \&init_tt , 'db2' => \&init_db2 , 'mysql' => \&init_mysql);
+my %inner_cmd = map{lc,1} qw|/ quit q bye exit l lt ll h help po|;
+
+
+sub welcome{
+print <<"EOF";
+   ################### 提示 ###################
+   # 欢迎使用BI侧数据库工具:$tool_name
+   # 当前为交互模式,help获取帮助,q退出交互模式
+   # 作者:damoen\@qq.com   版本:$version
+   ############################################
+EOF
+}
+
+sub help{
+
+print <<EOF
+
+---导出导入---
+unload to filename select * from table
+<load|iload|rload|aload|tload> from filename insert into tab_name
+<load|iload|rload|aload|tload> from filename insert into tab_name(a, b)
+
+load模式说明如下
+
+rload : replace  load 模式
+aload : append   load 模式
+tload : truncate load 模式
+iload : insert   load 模式
+load  : 同insert
+
+---快捷操作--
+l       :列出所有SQL历史命令
+ll      :列出后10条SQL历史命令
+/       :再次执行当前命令
+/ [seq] :执行第seq条命令
+gg key  :库表搜索
+dic dict:NGCRM字典查询
+dig gid :NGCRM字典组查询
+p num   :指定oracle并行度为num
+po      :关闭oracle并行,即parallel off
+unix命令:!加shell命令或脚本,如输入[!ls]显示当前目录下的文件
+
+xplan sql            :查看sql的执行计划
+remark ams           :指定执行SQL时的备注信息为ams
+set colsep str       :指定导入字段分隔符为 str
+set pagesize num     :指定分页大小
+q|quit|bye|exit      :退出
+diff table_a table_b :数据差异核对综合分析器
+
+说明：
+单行输入模式 → 1.SQL语句以分号结尾 2.非SQL语句无需加分号
+多行输入模式 → 以分号分隔命令行（SQL或是内置命令或UNIX命令）
+
+EOF
+;
+}
+
+##字典查询                
+sub dic{
+    my $dic = shift;
+    return unless $dic;
+    return if length($dic) == 1;
+    my $sql = "select * From xxx.xxx where regexp_like(xxx,?,'i')";
+    my $sth = $dbh->prepare($sql) or warn $dbh->errstr and return;
+    $sth->bind_param(1,$dic);
+    sql_qry($sth);
+}
+
+#字典组查询
+sub dig{
+    my $dig = shift;
+    return unless $dig;
+    return if length($dig) == 1;
+    my $sql = "select * From xxx.xxx where regexp_like(xxx,?,'i')";
+    my $sth = $dbh->prepare($sql) or warn $dbh->errstr and return;
+    $sth->bind_param(1,$dig);
+    sql_qry($sth);
+}
+
+#加载配置文件
+sub load_cfg{
+    my $file = shift;
+    open FH,$file or die $!;
+    my (%hash,$section);
+    while(<FH>){
+        next if /^\s*\#/o;
+        chomp;
+        if(/^\[(\w+)\]\s*$/){
+            $section = $1;
+            next;
+        }else{
+            my($key,$val) = split /\s*\=\s*/o,$_,2;
+            if($section){
+                $val = eval{$val;};
+                die "load config err..!" if $@;
+                $hash{$section}{$key} = $val;
+            }else{
+                next;
+            }
+        }
+    }
+    close FH or die $!;
+    return %hash;
+}
+
+my %cfg = load_cfg($cfg_file);
+$notes = $cfg{'COMMON'}{'remark'} if $cfg{'COMMON'}{'remark'} ;
+my $log_dir = $cfg{'COMMON'}{'log'};
+my $today = strftime("%Y%m%d",localtime);
+my $lfile = "$log_dir/${tool_name}_$today";
+open my $logfh,">>$log_dir/${tool_name}_$today" or die $!;
+my $bak_dir = $cfg{'COMMON'}{'bak_dir'} ? $cfg{'COMMON'}{'bak_dir'} : "$ENV{HOME}/perl_bak";
+
+#捕获异常退出信号
+$SIG{TERM} = $SIG{QUIT} = sub{$interrupt=1;dblog($logfh,"Catch Single:Ctrl+d.. exit now!",'W');exit -1};
+$SIG{INT} = sub{ dbrollback($dbh,'Ctrl+c');$interrupt=1;print "Input [q] to exit.\n"};
+
+#敏感信息初始化
+my $sensitive_file = "$cfg{'COMMON'}{'sensitive'}";
+my %mark_key = map{chomp;lc,1} qx{cat $sensitive_file} if -f $sensitive_file && -s _;
+my @mark_tmp = sort keys %mark_key;
+my $match_key = join('|',@mark_tmp);
+my $match_reg = eval{qr/\s+(?:\w+\.)?(?:$match_key)(_\d+)?/smi} or die "regexp match_reg failed ..";
+my $match_note = eval{qr/\/\s*\*\s*\S+\s*\*\s*/smi} or die "regex match_note failed ..";
+
+#敏感信息校验
+sub chk_sensitive{
+    my ($regex,$match_note,$input) = @_;
+    my(@buffer,@word,$echo_str);
+    if($input =~ $regex){
+        return 0 if $input =~ $match_note;
+        for(split "",$input){
+            push @buffer,$_;
+            if(/\w/o){
+                push @word,$_;
+            }else{
+                my $key = join("",@word);
+                if($mark_key{lc($key)}){
+                    my $echo_str = join("",@buffer[0..$#buffer-1]);
+                    my $mingan = join("",@word[0..$#word-1]);
+                    return "${echo_str}此处将涉及敏感信息[\033[5;7m$mingan\033[0m],请提供解释备注..";
+                }else{
+                    @word = ();
+                }
+            }
+        }
+        return 0;
+    }
+    return 0;
+}
+
+#日志函数
+my $pid = $$;
+sub dblog{
+    my($fh,$info,$level,$flag) = @_;
+    $level ||= 'I';
+    $info =~ s/^\s//;
+    my $now = strftime "%Y-%m-%d %X",localtime();
+    if($flag){
+        my $w = $level eq 'W' ? "→\033[5;7mWarning\033[0m:" : "→\033[5;7mError\033[0m:";
+        $w = '' if $level eq 'I';
+        print "${w}" . "$info\n";
+    }
+    print $fh "[$level] [$now] [$pid] $info\n";
+}
+
+#参数设置
+sub set{
+    my $input = join(' ',@_);
+    my($opt,$val) = split /\s+/,$input,2;
+    if($opt eq 'colsep'){
+        $sep = $val;
+        dblog($logfh, "${tag}设置全局导入分隔符为[ $sep ]",'I',1);
+    }elsif($opt eq 'pagesize'){
+        if($val =~ /^\d+$/o){
+            $pagesize = $val;
+            dblog($logfh, "${tag}设置全局分页大小值[ $val ]",'I',1);
+        }else{
+            dblog($logfh,"设置全局分页大小pagesize值[$val]失败,分布值必须为数字,请检查..",'W',1);
+        }
+    }elsif($opt eq 'flush'){
+        if($val =~ /^\d+$/o){
+            $rows_num = $val;
+            dblog($logfh, "${tag}设置全局分页大小值[ $val ]",'I',1);
+        }else{
+            dblog($logfh,"设置书刷屏提醒rows_num值[$val]失败,刷屏提醒值必须为数字,请检查..",'W',1);
+        }
+    }else{
+        dblog($logfh,"set设置[set $val]无效,请检查..",'W',1);
+    }
+}
+
+#获取数据库连接句柄$dbh
+sub get_dbh{
+    my ($driver,$sid,$user,$password,$parallel,$fh) = @_;
+    my($dsn,$dbh);
+    eval{
+        $dsn = "DBI:$driver:$sid";
+        $dbh = DBI->connect($dsn,"$user","$password",\%attr);
+        $dbh->do("alter session set nls_date_format='yyyy-mm-dd hh24:mi:ss'");
+        if($parallel){
+            $dbh->do("alter session enable parallel dml");
+            $dbh->do("alter session force parallel dml parallel $parallel");
+            $dbh->do("alter session force parallel query parallel $parallel");
+        }
+        $dbh->{LongTruncOk} = 1;
+        $dbh->{LongReadLen} = 100000;
+    };
+    if($@){
+        warn "$@";
+        dblog($fh,"连接数据库dburl:[$user\@$sid]失败!",'E',1) if $fh;
+        return -1;
+    }else{
+        dblog($fh,"连接数据库成功,dburl:[$user\@$sid].") if $fh;
+        return $dbh;
+    }
+}
+
+sub set_parallel{
+    my $dbh = shift;
+    my $parallel = shift;
+    $dbh->do("alter session enable parallel dml");
+    $dbh->do("alter session force parallel dml parallel $parallel");
+    $dbh->do("alter session force parallel query parallel $parallel");
+    dblog($logfh, "${tag}启用会话级并行,并行值:$parallel",'I',1);
+}
+
+sub unset_parallel{
+    my $dbh = shift;
+    $dbh->do("alter session disable parallel dml");
+    $dbh->do("alter session disable parallel query");
+    dblog($logfh, "${tag}关闭会话级并行..",'I',1);
+}
+
+#ora预编译
+sub init_ora{
+    my $dbh = shift;
+    my $file = "$tool_dir/login_dbi.sql";
+    if(-r "$file" && -f _){
+        local $/ = ';';
+        open(FH,"$file") or die "cat not open $file:$!";
+        while(<FH>){
+            chomp;
+            #@sysparam={ select * from fsib.ib_gl_sysparam where systemid = ? }
+            my @line = split('\=\{',$_,2);
+            if(@line == 2 and $line[0] =~ /^\@[a-z]{3,}/i and $line[1] =~ /select/i){
+                $line[0] =~ s/^@//;
+                $line[1] =~ s/^\s+|\}//;
+                my ($key,$sql) = @line;
+                $pre_sth{$key} = $dbh->prepare("$sql") or die $dbh->err;
+            }
+        }
+        close FH;
+    }     
+    #脚本内部使用语句编译
+    $pre_sth{'ora_desc'} = $dbh->prepare(qq{select c.COLUMN_NAME "Name",case c.DATA_TYPE when 'NUMBER' then c.DATA_TYPE||'('||c.DATA_PRECISION||')' when 'DATE' then 'DATE' when 'NVARCHAR2' then 'VARCHAR2('||c.DATA_LENGTH*2||')' else c.DATA_TYPE||'('||c.DATA_LENGTH||')' END "Type",case c.NULLABLE when 'N' then 'NOT NULL' else '' END "Null",
+                nvl2((select i.COLUMN_NAME from dba_ind_columns i where c.OWNER = i.TABLE_OWNER and c.TABLE_NAME = i.TABLE_NAME and c.COLUMN_NAME = i.COLUMN_NAME and ROWNUM = 1),'Y','') "Index"
+  from dba_tab_cols c where /*$notes*/ (c.OWNER = upper(?) or c.OWNER = 'SYS') and c.TABLE_NAME = upper(?) order by c.COLUMN_ID}) or die $dbh->errstr;
+    $pre_sth{'cols_cnt'} = $dbh->prepare(qq|select /*$notes*/count(*) from dba_tab_cols where OWNER = upper(?) and TABLE_NAME = upper(?)|);
+    $pre_sth{'tran_syn'} = $dbh->prepare(qq|select /*$notes*/TABLE_OWNER,TABLE_NAME from DBA_SYNONYMS where OWNER = upper(?) and SYNONYM_NAME = upper(?)|);
+    $pre_sth{'tab'} = $dbh->prepare(qq|select /*$notes*/OWNER,TABLE_NAME,TABLESPACE_NAME,NUM_ROWS from dba_tables where regexp_like(table_name,upper(?)) order by TABLE_NAME,OWNER|);
+    $pre_sth{'syn'} = $dbh->prepare(qq|select /*$notes*/* from dba_synonyms where regexp_like(SYNONYM_NAME,upper(?))|);
+    $pre_sth{'inf'} = $dbh->prepare(qq|select /*$notes*/nvl(ind.TABLE_OWNER,cons.OWNER) OWNER,nvl(ind.TABLE_NAME,cons.TABLE_NAME) TABLE_NAME,nvl(ind.COLUMN_NAME,cons.COLUMN_NAME) COLUMN_NAME,ind.INDEX_NAME,cons.CONSTRAINT_NAME from (select * from dba_ind_columns  where TABLE_OWNER = upper(?) and TABLE_NAME= upper(?)) ind full join (select a.* from dba_cons_columns a,dba_constraints b where a.OWNER = b.OWNER and a.TABLE_NAME = b.TABLE_NAME and a.CONSTRAINT_NAME = b.CONSTRAINT_NAME and b.CONSTRAINT_TYPE='P' and b.OWNER = upper(?) and b.TABLE_NAME= upper(?)) cons on ind.TABLE_OWNER = cons.OWNER and ind.TABLE_NAME = cons.TABLE_NAME and ind.COLUMN_NAME = cons.COLUMN_NAME order by POSITION|);
+    $pre_sth{'cols_info'} = $dbh->prepare(qq/select COLUMN_NAME,DATA_TYPE from dba_tab_cols where OWNER = upper(?) and TABLE_NAME = upper(?) order  by column_id/);
+    dblog($logfh,"ORACLE初始化预编译环境完成..");
+}
+
+##帮助提示
+sub useage{
+    my $flag = shift;
+    my $info = $flag ? 'conn' : $tool_name;
+    print "\nUseage:$info [user[/password]\@]sid\n\n";
+    $flag ? return -1 : exit -1;
+}
+
+#解密
+my(%map_hash,%de_map_hash);
+my @map = qw/C t j a 3 $ S J E v m d 5 ! V L H y o f 8 = X O A h Z Q r l b 4 ` T K B i 1 & g % M D _ n # F w p Y P G e 6 u W 2 I 9 z s U/;
+@map_hash{('a'..'z','A'..'Z',0..9)} = @map;
+$de_map_hash{$map_hash{$_}} = $_ for keys %map_hash;
+sub dec{
+    my $str = shift;
+    my @s = split "",$str;
+    my $s1 = shift @s;
+    my $s2 = shift @s;
+    my @pre = ($s1,$s2);
+    for(0..1){
+        next unless exists $de_map_hash{$pre[$_]};
+        $pre[$_] = $de_map_hash{$pre[$_]};
+    }
+    splice(@s,1,3,@pre);
+    my $enc_str = join("",@s);
+    my $dec_str = decode_base64("$enc_str");
+    chomp($dec_str);
+    return $dec_str;
+}
+
+#加密
+sub enc{
+    my $str = shift;
+    $str = encode_base64("$str");
+    my @r = (0..9,'$','%','a'..'z','A'..'Z','-','+','_','`','!','#');
+    my @s = split "",$str;
+    my @a = map{srand(time ^ $$ ^ $_);$r[int rand @r]} 0..2;
+    my @x = splice(@s,1,2,@a[0..2]);
+    unshift @s,@x;
+    for(0..1){
+        next unless exists $map_hash{$s[$_]};
+        $s[$_] = $map_hash{$s[$_]};
+    }
+    my $enc_str = join("",@s);
+    chomp($enc_str);
+    return $enc_str;
+}
+
+##初始化数据库连接
+my ($dbi_driver,$sid,$user,$passwd,$parallel,$de_passwd,$diff_flag);
+sub init_conn{
+    my $args = shift;
+    if($args =~ /(?:(\w{3,})(\/.+)?\@)?(\S+)/o){
+        ($user,$passwd,$sid) = ($1,$2,$3);
+        $passwd =~ s#^/##;
+        $de_passwd = $passwd if $passwd;
+        if($cfg{uc($user)}){ #存在配置文件的情况,如密码手工输入则取手工输入密码
+            ($dbi_driver,$sid,$user,$parallel) = @{$cfg{uc($user)}}{qw/driver sid user parallel/};
+            $passwd = $cfg{uc($user)}{'passwd'} unless $de_passwd;
+        }
+        $dbi_driver ||= $cfg{'DB'}{'driver'};
+        $sid ||= $cfg{'DB'}{'sid'};
+        $user ||= $cfg{'DB'}{'user'};
+        $passwd ||= $cfg{'DB'}{'passwd'} if $user =~ /^$cfg{'DB'}{'user'}$/i;
+        $parallel ||= $cfg{'DB'}{'parallel'};
+        $de_passwd = dec($passwd) unless $de_passwd;
+        return useage($inner_flag) unless $sid;
+        unless($user){
+            eval{
+                print "${dbi_driver}用户:";
+                chomp($user = <STDIN>);
+            };
+            warn "$@" and return -1 if $@;
+        }
+        unless($de_passwd){
+            eval{
+                print "$user\'密码:";
+                system('stty -echo');
+                #chomp($de_passwd = `line`);
+                chomp($de_passwd = <STDIN>);
+                system('stty echo');
+            };
+            warn "$@" and return -1 if $@;
+        }
+        $diff_flag = 1 if(dec($passwd) ne "$de_passwd");
+        return get_dbh($dbi_driver,$sid,$user,$de_passwd,$parallel,$logfh);
+    }else{
+        return useage($inner_flag);
+    }
+}
+
+#解析oracle_desc table命令
+sub desc_table{
+    my ($cmd) = @_;
+    my @tmp = split /\s+/,$cmd;
+    my @tmp2 = split /\./,$tmp[1];
+    my (@table,$feedback,$rvl_ref);
+    if(@tmp2 == 2){ @table = @tmp2 }elsif(@tmp2 == 1){ @table = ($user,$tmp2[0]) }else{ dblog($logfh, "Bad desc..",'I',1);return -1   };
+    eval{
+        $pre_sth{'ora_desc'}->bind_param(1,$table[0]);
+        $pre_sth{'ora_desc'}->bind_param(2,$table[1]);
+        ($feedback) = sql_qry($pre_sth{'ora_desc'},'rsdp');
+        if($feedback < 1){
+            $pre_sth{'tran_syn'}->execute(@table);
+            my @line = $pre_sth{'tran_syn'}->fetchrow_array();
+            if(length($line[0]) && length($line[1])){
+                print "\n\U$table[0].$table[1] 属同义词,指向:$line[0].$line[1]\n";
+                $pre_sth{'ora_desc'}->bind_param(1,$line[0]);
+                $pre_sth{'ora_desc'}->bind_param(2,$line[1]);
+                sql_qry($pre_sth{'ora_desc'});
+            }
+        }
+    };
+    dblog($logfh, $@,'W',1) if $@;
+    dblog($logfh, "库表[$tmp[1]]不存在,请检查.",'W',1) and return -1 if $feedback < 1;
+    print "\n";
+}
+
+#创建目录
+sub make_dir{
+    my $dir = shift;
+    system("mkdir -p -m 700 $dir") and die "Can't create path $dir:$!" unless -d $dir;
+    return $dir;
+}
+
+#修改配置文件
+sub modify_cfg{
+    my ($file,$user,$de_passwd) = @_;
+    my $pass = enc($de_passwd);
+    chomp($pass);
+    my $file_name = (split /\//,$file)[-1];
+    dblog($logfh,"配置文件更新..");
+    my $now = strftime("%Y%m%d%H%M%S",localtime);
+    my $dir = make_dir($bak_dir);
+    my $bak_file = "$dir/${file_name}_$now";
+    system("cp $file $bak_file") and die "Can't cp $file..";
+    open FH,$file or die $!;
+    my $new_file = $cfg_dir ? "${cfg_dir}/dbi_tmp_cfg_$now" : "dbi_tmp_cfg_$now";
+    open FW,">$new_file" or die $!;
+    my($flag);
+    while(<FH>){
+        if(/user\s*=\s*$user/i){
+            $flag = 1;
+            print FW $_;
+            next;
+        }
+        $flag = 0 if(/\[\S+\]/o);
+        if($flag && /passwd\s*=\s*\S+/){
+            print FW "passwd=$pass\n";
+            next;
+        }
+        print FW $_;
+    }
+    unless($cfg{uc($user)}){
+        print FW "\n\[",uc($user),"\]\n";
+        print FW "driver=$dbi_driver\n";
+        print FW "sid=$sid\n";
+        print FW "user=$user\n";
+        print FW "passwd=$pass\n";
+        print FW "parallel=$parallel\n";
+    }
+    close FH;
+    close FW;
+    rename("$new_file","$file") or die $!;
+}
+
+##数据查询函数
+sub sql_qry($;$){
+    my($sth,$flag) = @_;
+    my($start_time,$end_time,$time_cost);
+    $start_time = time();
+    eval{$sth->execute();};
+    dblog($logfh,"执行SQL出错:$@",'W',1) and return -2 if $@;
+    ##简单返回结果数据 \@result
+    if($flag == 1){
+        my @result;
+        eval{
+            while(my @line = $sth->fetchrow_array()){
+                if($interrupt){$sth->finish;$interrupt=0;return -2};
+                push @result,[@line];
+            }
+        };
+        if($@){dblog($logfh,"执行call_sql出错:$@",'W',1);$sth->finish if $sth;return -2};
+        $sth->finish() or die $!;
+        return \@result;
+    }else{ #复杂返回情况,可返回\%colsize \@col_name $rows \@result
+    
+        #列标题处理
+        my @tmp_col_name = @{$sth->{NAME}};
+        my (%col_cnt,@col_name);
+        for(@tmp_col_name){ ##相同列名添加别名处理
+            $_ .= ($col_cnt{$_} - 1) if(++$col_cnt{$_} != 1);
+            push @col_name,$_;
+        }   
+        my %colsize = map{$_,length($_)} @col_name;
+        
+        #计算字段宽度，缓存查询结果（以哈希数组的形式保存 push @result,{%row}）
+        my (%row,@result);
+        my $last_second = @col_name - 2;
+        $sth->bind_columns( \(@row{@col_name}) );
+        my $get_size_flag = 1 if !$flag || $flag =~ /s/;
+        eval{
+            while($sth->fetch){
+                if($interrupt){$sth->finish;$interrupt=0;return -2};
+                if($get_size_flag){
+                    map{$colsize{$_} = length("$row{$_}") if length("$row{$_}") > $colsize{$_}} @col_name[0..$last_second];
+                }
+                push @result,{%row};
+            }
+        };
+        if($@){dblog($logfh,"执行call_sql出错:$@",'W',1);$sth->finish if $sth;return -2};
+        $sth->finish() or die $!;
+        if($interrupt){$sth->finish;$interrupt=0;return -2};
+        ##处理返回哪些结果
+        my $rows = $sth->rows;
+        my %res = ('r'=>$rows,'s'=>\%colsize,'c'=>\@col_name,);
+        my @ret;
+        if($flag){
+            for(split "",$flag){
+                next if $_ =~ /^(?:d|p)$/io; ##打印标识略过
+                push @ret,$res{$_} if defined $res{$_};
+            }
+            push @ret,\@result;
+            return @ret if $flag !~ /p/;
+        }
+        $end_time = time();
+        $time_cost = sprintf("%.5f", $end_time - $start_time);
+        print " \n no rows selected. Elapsed: ${time_cost}s\n" if $rows<1 && $flag !~ /d/io;
+        return $rows if $rows<1;
+        
+        #计算打印格式和行宽，行列模式打印选择判断
+        my ($fmt,$fmt_size,$fmt_line);
+        map{$fmt .= "%-$colsize{$_}s ";$fmt_line .= '-' x $colsize{$_} . ' ';$fmt_size += $colsize{$_}} @col_name;
+        $fmt =~ s/\s+$//;
+        $fmt_line =~ s/\s+$//g;
+        $fmt_size += (@col_name - 1);
+        
+        #列模式打印
+        chomp(my $term_size = `tput cols`);
+        if($fmt_size > $term_size){
+            print " \033[1m\n→提醒:输出结果长度($fmt_size)大于终端屏幕宽度($term_size),启用列模式打印(y/n):\033[0m";
+            chomp(my $get = <STDIN>);
+            if($interrupt){$interrupt=0;return -2;}
+            print "\n";
+            $get =~ s/^\s+|\s+$//g;
+            if($get =~ /^y/i){
+                my $max_colsize;  #字段的最大长度,列模式打印要用到
+                map{$max_colsize = length($_) if length($_) > $max_colsize} @col_name;
+                my $i = 1;
+                for my $line_ref(@result){
+                    if($interrupt){$interrupt=0;return -2;}
+                    printf("%${max_colsize}s :%s\n",$_,$line_ref->{$_}) for @col_name;
+                    if($i<$#result+1){
+                        print '-' x $max_colsize," ",$i++,"  按回车继续、Ctrl+c退出\n";
+                        #`line`;
+                        <STDIN>;
+                    }
+                }
+                $end_time = time();
+                $time_cost = sprintf("%.5f", $end_time - $start_time);
+                print "\n $rows row selected. Elapsed: ${time_cost}s\n";
+                return $rows;
+            }
+        }
+        
+        ##行模式打印
+        my $flush = 0;
+        my $pre_rows = 16;
+        print "\033[1m\n→提醒:查询结果总记录数[$rows > $rows_num]行,默认打印前[$pre_rows]行,回车刷屏显示,Ctrl+c 中断查询..\n\033[0m" and $flush = 1 if $rows > $rows_num;
+        printf("\n $fmt\n",@col_name);print " $fmt_line\n";
+        my $j = 0;
+        for(@result){
+            if($interrupt){$interrupt=0;return -2;}
+            printf(" $fmt\n",@{$_}{@col_name});
+            $j++;
+            print " -----------------$j----------------\n" if (!($j % $pagesize) && $j != $rows) && $flag !~ /d/o;
+            <STDIN> if $j == $pre_rows && $flush;
+        }
+        if($j >= $rows_num){print " $fmt_line\n";printf(" $fmt\n",@col_name);}
+        $end_time = time();
+        $time_cost = sprintf("%.5f", $end_time - $start_time);
+        print "\n $rows row selected. Elapsed: ${time_cost}s\n" if $flag !~ /d/o;
+        $flag =~ /p/ ? return @ret : return $rows;        
+    }
+}
+
+##查看执行计划
+sub xplan{
+    my $in_sql = @_ > 1 ? join(' ',@_) : shift;
+    $in_sql =~ s/\;+$//sm;
+    my $sql = "explain plan for $in_sql";
+    $dbh->do($sql) or warn $dbh->errstr;
+    my $explain_sql = "select * from table(dbms_xplan.display)";
+    my $sth = $dbh->prepare($explain_sql) or warn $dbh->errstr and return -1;
+    sql_qry($sth,'rsdp');
+}
+
+#提交命令
+sub call_command{
+    my $call_command = shift;
+    my $i = 0;
+    my @commands = grep /\w/m,split /\;/sm,$call_command;
+    for(@commands){
+        s/^\s+|\s+$//sm;
+        next unless $_;
+        push @history,$_;
+        dblog($logfh,"\033[30;1mExec Command[",++$i,"]:$_\033[0m",'I',1) if @commands > 1;
+        if(/^xplan\s+(.+)/sm){
+            xplan($1);
+        }elsif(/^(?:select|merge|delete|insert|update|create|drop|alter|grant|explain|truncate|with|rename)\s+/io){
+            call_sql($_);
+        }elsif($inner_cmd{lc($_)} || /^(?:l|set|\/|gg|load|unload|desc|p|diff|remark)\s+\S+|\!(?:.+)/io){
+            call_inner($_);
+        }else{
+            dblog($logfh, "Bad command for [ $call_command ]..");
+            print "bad command..\n";
+        }
+    }
+}
+
+##提交数据库执行
+sub call_sql{
+    my $sql = shift;
+    my $remark = shift;
+    $sql =~ s/^\s+(?:;+)?|\s+$|\;$//om;
+    return if $sql =~ /^;+$/o || !$sql;
+    if($remark){
+        $sql =~ s#(update|delete|insert|merge)\s#$1 /*$remark*/ #smig; #有UDI操作插入单号
+        $sql =~ s|(\S*?$match_reg)|/*$remark*/ $1|mg if $chk_sen;     #在敏感表之前插入单号
+    }
+    dblog($logfh,"Call_sql:$sql");
+    my ($sth,$rows);
+    if($sql =~ /^(?:select|with)\s+/io){
+        $sql =~ s/;$//m;
+        eval{$sth = $dbh->prepare($sql);};
+        dblog($logfh, $@,'W',1) and return -1 if $@;
+        sql_qry($sth);
+    }elsif($sql =~ /^(update|delete|insert|merge)\s+/i){
+        my $operation = lc($1);
+        eval{$rows = $dbh->do($sql);};
+        if($@){
+            dblog($logfh, $@,'W',1) and dbrollback($dbh) and return -1;
+        }else{
+            dblog($logfh, "\u$operation $rows rows..",'I',1);
+        }
+    }elsif($sql =~ /^create|drop|alter|grant|explain|truncate|rename\s+/io){
+        eval{$dbh->do($sql);};
+        my $operation = lc($1) if $sql =~ /^(\S+)\s/;
+        if($@){
+            dblog($logfh, "\u$operation command failed:$@",'W',1) and return -1;
+        }else{
+            dblog($logfh, "\u$operation Success..",'I',1);
+        }
+    }elsif($sql =~ /^commit/){
+        dbcommit($dbh);
+    }elsif($sql =~ /^rollback/){
+        dbrollback($dbh);
+    }else{
+        print "bad command..\n";
+    }
+}
+
+
+#交互式调用
+sub call_dbi{ 
+    #my $type = shift;
+    #print "${tag}未定义的数据库类型[$type],请检查..\n" and exit -1 if !$dbtype{$type};
+    my $timeout = defined $cfg{'COMMON'}{'timeout'} ? $cfg{'COMMON'}{'timeout'} : 30*60;
+    local $SIG{ALRM} = sub{print "\n\n${tag}Sorry,time out for $timeout seconds,exit now..\n\n";exit;};
+    alarm $timeout;
+    print "\n";
+    while(1){
+        print "$user\@$sid> ";
+        my $get;
+        eval{$get = <STDIN>;};
+        print $@ and next if $@;
+        alarm $timeout unless $timeout;
+        my $str = $get;
+        $get = (split /;/,$get)[-1] if $get =~ /;/ && $get !~ /\;$/;
+        $str =~ s/^\s+(?:\;+)?|\s+$//g;
+        next unless $str;
+        my ($func,@args) = split /\s+/,$str;
+        if(__PACKAGE__->can($func) && $func !~ /load/i){
+            if(!($func =~ /xplan/ && $get !~ /\;$/)){
+                dblog($logfh,"call_func:$func args:@args");&$func(@args);next;
+            }
+        }
+        if($inner_cmd{lc($str)} || $str =~ /^(?:l|set|\/|gg|(?:i|r|a|t)?load|unload|desc|p|diff|remark)\s+\S+|^\!(?:.+)/io){
+            call_inner($str) ; next;
+        }elsif($str =~ /\;/o){
+            my @sqls = split /;/,$str;
+            my @tmp_sql = $str =~ /\;$/ ? @sqls : @sqls[0..$#sqls-1];
+            my $i;
+            for(@tmp_sql){
+                next unless $_;
+                push @history,$str;
+                dblog($logfh, "\n\033[30;1mExec Command[",++$i,"]:$_\033[0m",'I',1) if @tmp_sql > 1;
+                call_sql($str);
+            }
+            shift @history if @history > 1000;
+            if($str =~ /;$/){
+                next;
+            }else{
+                print "$user\@$sid> $get";
+            }
+        }
+        local $/ = ";";
+        my $left;
+        eval{chomp($left = <STDIN>);};
+        print $@ and next if $@;
+        my $command_str = $get . $left;
+        call_command($command_str);
+        shift @history if @history > 1000;
+    }
+}
+
+#数据回滚
+sub dbrollback{
+    my ($dbh,$err) = @_;
+    eval{$dbh->rollback if $dbh};
+    if($@){
+        dblog($logfh, "Catch Exception:$err Rollback failed:$@",'W',1);
+    }else{
+        my $info = $err ? "Catch Exception:$err " : "";
+        dblog($logfh, "${info}Rollback success..",'I',1) if $err !~ /ctrl|end/i;
+    }
+}
+
+#数据提交
+sub dbcommit{
+    my $dbh = shift;
+    eval{$dbh->commit;};
+    if($@){
+        dblog($logfh, $@,'I',1) and dbrollback($dbh);
+        return -1;
+    }else{
+        dblog($logfh, "Commit done..",'I',1);
+    }
+    return 0;
+}
+
+
+
+##执行内部命令
+#my %inner_cmd = map{lc,1} qw|/ quit q bye exit l lt ll lh up|;
+sub call_inner{
+    my $command = shift;
+    $command =~ s/\;(\s+)?$//;
+    #$command = lc($command) if $command !~ /^(?:i|r|a|t)?load\s+/;
+    dblog($logfh,"Exec_cmd[ $command ]..");
+    if($command =~ /^(?:quit|q|bye|exit)$/i){
+        my $now = strftime "%Y-%m-%d %H:%M:%S",localtime;
+        print "\nquit! Time: $now\n\n";
+        exit 0;
+    }elsif($command eq 'lt' || $command eq 'll'){
+        return if !@history;
+        my $end = @history >= 10 ? 10 : @history;
+        for(reverse (1..$end)){
+            print "${tag}倒数第[$_]条: $history[$#history-$_+1]\n" if $history[$#history-$_+1];
+        }
+    #}elsif($command eq 'lh'){
+    #    print "${tag}无历史命令..\n" and return if !@history;
+    #    for(1..10){
+    #        print "${tag}第[$_]条命令: $history[$_-1]\n" if $history[$_-1];
+    #    }
+    }elsif($command =~ /^l(?:\s+(\d+))?(?:\s+(\d+))?/i && $command !~ /load/io){
+        return if !@history;
+        my($begin,$end) = ($1,$2);
+        if($command eq 'l'){
+            ($begin,$end) = (1,$#history+1);
+        }elsif($begin && !$end){
+            ($begin,$end) = (1,$begin);
+        }
+        dblog($logfh, "bad command..",'I',1) and return -1 if $begin > $end;
+        for(reverse $begin .. $end){
+            print "${tag}倒数第[$_]条: $history[$#history-$_+1]\n" if $history[$#history-$_+1];
+        }
+    }elsif($command =~ /^\/(?:\s+(\d+))?/i){
+        my $call_index = $1 ? $#history-$1+1 : $#history;
+        #print "Excute Sql: $history[$call_index]\n";
+        call_sql($history[$call_index]);
+    }elsif($command=~/^\!(.+)/i){
+        eval{system("$1")};dblog($logfh, $@,'W',1) if $@;
+    }elsif($command =~ /^gg\s+(?:\/\*\s*\S+\s*\*\/\s+)?(\w+(?:\.|\s+)?\w+)/io){
+        my $match = $1;
+        my @args = ($match =~ /\./ ? split /\./,$match : ($match =~ /\s/ ? split /\s+/,$match : $match));
+        return -1 if @args > 2 || @args < 1;
+        inf_tab(@args);
+    }elsif($command =~ /^unload\s+/io){
+        unload($command);
+    }elsif($command =~ /^(?:i|r|a|t)?load\s+/i){
+        if($command =~ /^((?:r|i|a|t)?load)\s+(\S+)\s+(\S+)$/i){
+            $command = "$1 from $2 insert into $3";
+        }
+        load($command);
+    }elsif($command =~ /^desc\s+\S+/io){
+        desc_table($command);
+    }elsif($command =~ /^p\s+(\d+)/io){
+        set_parallel($dbh,$1);
+    }elsif($command =~ /^po/io){
+        unset_parallel($dbh);
+    }elsif($command =~ /^(?:h|help)$/oi){
+        help();
+    }elsif($command =~ /^remark\s+(\S+)/io){
+        $notes = $1;
+    }elsif($command =~ /^set\s+(.+)/i){
+        set($1);
+    }else{
+        dblog($logfh, "bad command..",'I',1);
+    }
+}
+
+#查询主键,索引
+sub inf_tab{
+    my($owner,$table,$rows,$col_ref,$size_ref,$result_ref);
+    if(@_ == 2){
+        ($owner,$table) = @_;
+    }else{
+        $table = $_[0];
+        my $qry_table = "select distinct /* $notes */OWNER,TABLE_NAME,TABLESPACE_NAME,NUM_ROWS from dba_tables where regexp_like(TABLE_NAME,'$table','i') and num_rows > 0 order by 1,2";
+        #print "\n${tag}模糊查找:",lc($qry_table),"\n";
+        my $sth = $dbh->prepare($qry_table);
+        ($rows,$col_ref,$size_ref,$result_ref) = sql_qry($sth,'rcsp');
+        if($rows == 1){
+            ($owner,$table) = @{$result_ref->[0]}{qw/OWNER TABLE_NAME/};
+        }else{
+            return 0 if $rows < 1;
+            print "\n${tag}请选择用户名和表名(以空格分隔):";
+            my $input;
+            eval{chomp($input = <STDIN>);};
+            return -1 if $@;
+            $input =~ s/^\s+|\s+$//g;
+            ($owner,$table) = split /\s+/,$input;
+        }
+    }
+    
+    ($owner,$table) = (uc($owner),uc($table));
+    return -1 if !$owner || !$table;
+    
+    my(%cols,%ind,%ys,%pri,$sth,@columns);
+    my ($r,$c,$s,$v);
+        
+    #查字段sql
+    my $cols_sql = "select col.COLUMN_NAME,case DATA_TYPE when 'NUMBER' then case when DATA_SCALE is null or DATA_SCALE = 0 then DATA_TYPE||'('||DATA_PRECISION||')' else DATA_TYPE||'('||DATA_PRECISION||','||DATA_SCALE||')' end when 'DATE' then 'DATE' when 'NVARCHAR2' then 'NVARCHAR2('||DATA_LENGTH*2||')' else DATA_TYPE||'('||DATA_LENGTH||')' END type,decode(col.NULLABLE,'N','NOT NULL') NUL from DBA_TAB_COLUMNS col where col.table_name = '$table' and OWNER = '$owner' order by col.COLUMN_ID asc";
+    eval{
+        $sth = $dbh->prepare($cols_sql);
+        ($r,$c,$s,$v) = sql_qry($sth,'rcs');
+    };
+    return -1 if $@;
+    my $max_type_size = $s->{TYPE};
+    my $max_col_size = $s->{COLUMN_NAME};
+    for(@$v){
+        $cols{$_->{COLUMN_NAME}} = [$_->{TYPE},$_->{NUL},$s->{$_->{COLUMN_NAME}}];
+        push @columns,$_->{COLUMN_NAME}; 
+    }
+    
+    
+    #查索引
+    my $ind_sql = "select INDEX_OWNER,INDEX_NAME,TABLE_OWNER,TABLE_NAME,COLUMN_NAME from DBA_IND_COLUMNS where TABLE_OWNER='$owner' and TABLE_NAME='$table'";
+    eval{
+        $sth = $dbh->prepare($ind_sql);
+        ($r,$c,$s,$v) = sql_qry($sth,'rcs');
+    };
+    return -1 if $@;
+    for(@$v){
+        $ind{$_->{COLUMN_NAME}} = 'Y';
+    }
+    
+    #查主键，约束
+    my $ys_sql = "select distinct a.OWNER,a.TABLE_NAME,a.CONSTRAINT_NAME,a.COLUMN_NAME,b.CONSTRAINT_TYPE ctype from DBA_CONS_COLUMNS a,DBA_CONSTRAINTS b where a.OWNER = b.OWNER and a.TABLE_NAME = b.TABLE_NAME and a.CONSTRAINT_NAME = b.CONSTRAINT_NAME and a.table_name = '$table' and a.owner = '$owner' order by 4,5";
+    eval{
+        $sth = $dbh->prepare($ys_sql);
+        ($r,$c,$s,$v) = sql_qry($sth,'rcs');
+    };
+    return -1 if $@;
+    for(@$v){
+        $ys{$_->{COLUMN_NAME}} .= "$_->{CTYPE},";
+        $pri{$_->{COLUMN_NAME}} = 1 if $_->{CTYPE} =~ /U|P/o;
+    }
+    $ys{$_} =~ s/\,$// for keys %ys;
+    
+    #查库表一条记录
+    my $table_name = $owner . '.' . $table;
+    my $sql = qq|select /* $notes */* from $table_name where rownum<=1|;
+    eval{
+        $sth = $dbh->prepare($sql);
+        ($r,$c,$s,$v) = sql_qry($sth,'rcs');
+    };
+    return -1 if $@;
+    #汇总结果并打印
+    my $max_size;
+    map{$max_size = $s->{$_} if $s->{$_}>$max_size} @columns;
+    $max_size = length($v->[0]{$columns[-1]}) if length($v->[0]{$columns[-1]}) > $max_size; #打印需要，检查最后一个字段的长度值
+    $max_size = 3 unless $max_size;
+    my $fmt_title = "\n\033[1;4m%${max_col_size}s  %-${max_size}s  %-${max_type_size}s  %-4s  %-3s  %-s\033[0m\n";
+    print "\n\033[31m${tag}Table_Name:$table_name\033[0m\n";
+    printf "$fmt_title",qw/COL VAL TYPE CONS IND NULL/;
+    my $fmt = "%${max_col_size}s: %-${max_size}s |%-${max_type_size}s |%-4s |%-3s |%-s\n";
+    for my $row(@{$v}){
+        for(@columns){
+            my $color = $pri{$_} ? "\033[31m" : ($ind{$_} ? "\033[33m" : '');
+            printf "${color}$fmt\033[0m",$_,$row->{$_},$cols{$_}[0],$ys{$_},$ind{$_},$cols{$_}[1];
+        }
+    }
+    my @pri_key = keys %pri;
+    my @sy_key = keys %ind;
+    print "\n";
+    if(@pri_key){
+        print "\033[31m${tag}库表[$table_name]主键字段[@pri_key]\033[0m\n";
+    }else{
+        print "\033[31m${tag}库表[$table_name]没有主键字段\033[0m\n";
+    }
+    if(@sy_key){
+        print "\033[33m${tag}库表[$table_name]索引字段[@sy_key]\033[0m\n";
+    }else{
+        print "\033[33m${tag}库表[$table_name]没有索引字段\033[0m\n";
+    }
+}
+
+#数据导出函数
+sub unload{
+    #unload to filename select * from table
+    my ($comman) = @_;
+    my @tmp = split(/\s+/,$comman,4);
+    if(@tmp != 4 || $tmp[3] !~ /^(?:select|with)/i){
+        warn "Bad unload..\n";
+        dblog($logfh,"Exec[ $comman ] Fail",'E');return -1;
+    }    
+    open(OUT,">$tmp[2]") or ( dblog($logfh,"cat not open $tmp[2]:$!",'E') && die "cat not open $tmp[2]:$!\n" );
+    my ($sth,$start_time,$end_time);
+    eval{
+        $sth = $dbh->prepare($tmp[3]) || die $dbh->err;
+        $start_time = time();
+        my $now_time = strftime "%Y-%m-%d %H:%M:%S",localtime($start_time);
+        print "start Time: $now_time\n";
+        $sth->execute();
+    };
+    if($@){
+        warn "$@";
+        dblog($logfh,"$@",'E');unlink $tmp[2];
+    }else{
+        my $row_cnt = 0;
+        my $rows = []; # cache for batches of rows
+        ##批量导数
+        while(
+            my $row_ref = ( shift(@$rows) || # get row from cache, or reload cache:
+                    shift(@{$rows=$sth->fetchall_arrayref(undef,10_000)||[]}) )
+            ) {
+                if($interrupt){$sth->finish;$interrupt=0;return -2};
+                print OUT join('|',@{$row_ref}),"\n";
+                $row_cnt++;
+                dblog($logfh, "write out:$row_cnt rows.",'I',1) unless $row_cnt%200_000;
+            }
+        dblog($logfh, "write  out: $row_cnt line.",'I',1);
+        $end_time = time();
+        my $now_time = strftime "%Y-%m-%d %H:%M:%S",localtime($end_time);
+        print "end Time: $now_time\n";
+        my $time_cost = sprintf("%.5f", $end_time - $start_time);
+        my $file_size = sprintf("%.3f", (-s $tmp[2]) / 1024 / 1024);
+        my $avg_unload =  $time_cost > 0 ? sprintf("%.f", $row_cnt / $time_cost)  : 0;
+        dblog($logfh, "导出文件:$tmp[2] 大小:${file_size}M 耗时:${time_cost}s 共[ $row_cnt ]条记录 效率:$avg_unload/s ",'I',1);
+    }
+    close(OUT);
+}
+
+#数据装载函数
+#sqlldr以append方式装载数据
+sub sqlldr{
+    my ($infile,$sql,$action) = @_;
+    my $src_sql = $sql;
+    $sql =~ s#/\*.+?\*/##g; #去注释
+    $sql =~ s/^\s+//g;
+
+    #格式:load from filename insert into tab_name(a,b)
+    my @pre_column;
+    @pre_column = split('\,',$1) if($sql =~ /\((.+)\)\s/);
+    
+    #判断列是否为时间类型
+    #--提取表名
+    my @table;
+    if($sql =~ /into\s+(\S+)[\s\/]?/i){
+        my @tmp = split('\.',$1);
+        if(@tmp == 2){
+            @table = @tmp;
+        }elsif(@tmp == 1){
+            @table = ($user,$tmp[0]);
+        }
+    }else{
+        dblog($logfh, "Bad load,not found table...",'I',1);
+        return -1;
+    }
+    
+    #封装列信息
+    my $date_fmt = 'yyyy-mm-dd hh24:mi:ss';
+    my @ctrl_cols;
+    my $tar_table = join '.',@table;
+    $pre_sth{'cols_info'}->execute(@table) ;
+    while(my @line = $pre_sth{'cols_info'}->fetchrow_array()){
+        my $str = ( $line[1] =~ /(?:DATE|TIMESTAMP)/ ? qq/  $line[0] $line[1] "$date_fmt"/ : qq/  $line[0]/);
+        if(@pre_column > 0){
+            push @ctrl_cols,$str if (grep{/$line[0]/} @pre_column);
+        }else{
+            push @ctrl_cols,$str;
+        }
+    }
+    $pre_sth{'cols_info'}->finish;
+    
+    if(@ctrl_cols == 0){
+        warn "查找表:$tar_table 的列信息失败,无法创建sqlldr的ctrl文件.\n";
+        dblog($logfh,"查找表:$tar_table 的列信息失败,无法创建sqlldr的ctrl文件.",'E');
+        return -1;
+    }
+    
+    my @ctrl_head = ('LOAD DATA',"INFILE '$infile'","$action INTO TABLE","$tar_table","FIELDS TERMINATED BY '$sep'",'TRAILING NULLCOLS');
+    my $prefix_file = "SqlLoader.$table[1]_$$";
+    my $output_dir = (-w "$ENV{PWD}" ? $ENV{PWD} : $log_dir);
+    my ($ctl_file,$log_file,$bad_file) = ("${prefix_file}.ctl","${prefix_file}.log","${prefix_file}.bad");
+    open(CTL,">$ctl_file") or die "cat not create $ctl_file:$!";
+    my $col_info = join ",\n",@ctrl_cols;
+    print CTL join "\n",@ctrl_head;
+    print CTL "(\n$col_info\n)\n";
+    close CTL;
+    
+    #commit缓冲区大小为10Mbytes
+    my $cmd = " $ENV{ORACLE_HOME}/bin/sqlldr $user\@$sid control=$ctl_file log=$log_file bad=$bad_file rows=5000 readsize=10340000 bindsize=10340000 errors=3 ";
+    dblog($logfh,"Run command[$cmd]") ;
+    my $rec = system("echo $de_passwd | $cmd");
+    if ( $rec == 0 ){
+        unlink($ctl_file);
+        unlink($log_file);
+        dblog($logfh,"Load $infile $tar_table succ..",'I',1)  ;
+    }else{
+        print "sqlldr出错,控制文件:$ctl_file 日志文件:$log_file\n";
+        dblog($logfh,"load $infile $tar_table fail:$rec",'W') ;
+        return -1;
+    }
+    return 0;
+}
+
+#数据装载主函数
+sub load{
+    #格式:load from filename insert into tab_name(a,b)
+    my ($comman) = @_;
+    my @tmp = split(/\s+/,$comman,4);
+    if(@tmp != 4 || $tmp[3] !~ /^insert/i || $comman !~ /(?:i|r|a|t)?load\s+from/io){
+        warn "Bad load..\n";dblog($logfh,"Exec[ $comman ] Fail",'E');return -1;
+    }
+    #print "\n\033[1m${tag}Exec[ $comman ]\033[0m\n";
+    my $flag = lc(substr($tmp[0],0,1));
+    my ($action,$pre_sql);
+    if($flag eq 'a'){
+        $action = 'APPEND';
+    }elsif($flag eq 'i'){
+        $action = 'INSERT';
+    }elsif($flag eq 'r'){
+        $action = 'REPLACE';
+    }elsif($flag eq 't'){
+        $action = 'TRUNCATE';
+    }else{
+        $action = 'INSERT';
+    }
+    #文件预处理.
+    return -1 unless (-f $tmp[2] && -s _);
+    my $file_rows = (`wc -l $tmp[2]` =~ /(\d+)/ ? $1 : 0);
+    if($file_rows == 0){
+        return -1;
+    }elsif($file_rows > 3000){
+        if(-e "$ENV{ORACLE_HOME}/bin/sqlldr"){
+            return sqlldr(@tmp[2,3],$action);
+        }else{
+            dblog($logfh,"未能检测到sqlldr,将采取逐行insert方式插入.",'I',1);
+        }
+    }
+    
+    open(IN,"$tmp[2]") or ( dblog($logfh,"cat not open $tmp[2]:$!",'E') && die "cat not open $tmp[2]:$!\n" );
+    
+    #计算列数
+    my $column_num = 0;
+    my $src_sql = $tmp[3];
+    $tmp[3] =~ s#/\*.+?\*/##g;
+    my $table_name;
+    if($tmp[3] =~ /(\w+)\((.+)\)/){ #格式:load from filename insert into tab_name(a,b)
+            $column_num = split('\,',$2);
+            $table_name = $1 =~ /\./ ? $1 : "${user}" . '.' . $1;
+    }elsif($tmp[3] =~ /into\s+(\S+)[\s\/]?/i){ #格式:load from filename insert into tab_name
+        my @tmp2 = split('\.',$1);
+        if(@tmp2 == 2){
+            $pre_sth{'cols_cnt'}->bind_param(1,$tmp2[0]);
+            $pre_sth{'cols_cnt'}->bind_param(2,$tmp2[1]);
+            $table_name = join('.',@tmp2);
+        }elsif(@tmp2 == 1){
+            $pre_sth{'cols_cnt'}->bind_param(1,$user);
+            $pre_sth{'cols_cnt'}->bind_param(2,$tmp2[0]);
+            $table_name = $user . '.' . $tmp2[0];
+        }else{
+            print "Bad load,not found table...\n";
+            return 0;
+        }
+        $pre_sth{'cols_cnt'}->execute();
+        my @cnt = $pre_sth{'cols_cnt'}->fetchrow_array();
+        $column_num = $cnt[0];
+    }
+    if($flag eq 'r'){
+        $pre_sql = "delete from $table_name";
+    }elsif($flag eq 't'){
+        $pre_sql = "truncate table $table_name";
+    }elsif($flag eq 'a'){
+        $pre_sql = '';
+    }else{
+        $pre_sql = "select count(*) from $table_name where rownum<=1"; 
+    }
+
+    if($pre_sql){
+        if($pre_sql =~ /select/i){
+            my $sth = $dbh->prepare($pre_sql);
+            eval{$sth->execute();};
+            dblog($logfh,"${tag}:查询库表[$table_name]记录数据失败:$@",'W',1) and return -1 if $@;
+            my @line = $sth->fetchrow_array();
+            if($line[0] == 1){
+                dblog($logfh,"${tag}For INSERT option, table must be empty.",'W',1);
+                return -1;
+            }
+        }else{
+            eval{
+                $dbh->do($pre_sql);
+                $dbh->commit if $flag eq 'r';
+            };
+            if($@){
+                dblog($logfh,"${tag}:delete or truncate table[$table_name] failed:$@",'W',1);
+                dbrollback($dbh,$@);
+                return -1;
+            }
+        }
+    }
+
+    my $tar_sql;
+    if($column_num == 0){
+        warn "→列数计算失败,无法确定占位符个数.\n" and return -1;
+    }else{
+        my $condtion = join ',',('?') x $column_num;
+        $tar_sql = qq/$src_sql values($condtion)/;
+        dblog($logfh,"封装处理后SQL:$tar_sql");
+    }
+    my $sth =  $dbh->prepare("$tar_sql") or die $dbh->errstr;
+    my $start_time = time;
+    my $modify_rows = 0;
+    while(<IN>){
+        my $record = $_;
+        chomp $record;
+        if($interrupt){$interrupt=0;return -1};
+        next if $record =~ /^\s*$/o;
+        my @line = split('\|',$record,-1);
+        eval{
+            $sth->execute(@line);
+            unless($. % 1000){
+                $dbh->commit;
+                dblog($logfh,"导入[$.]行数据,休眠0.2秒后继续..",'I',1);
+                sleep 0.2;
+            }
+            $dbh->commit if eof(IN);
+        };
+        warn $@ and dbrollback($dbh,$@) and close IN and return -1 if $@;
+    }
+    $dbh->commit or die $dbh->errstr;
+    my $end_time = time();
+    my $time_cost = sprintf("%.5f", $end_time - $start_time);
+    dblog($logfh,"数据装载完成,共[$.]条数据,耗时:${time_cost}s",'I');
+    print "\n${tag}数据装载完成,共[$.]条数据,耗时:${time_cost}s\n";
+    close IN or die $!;
+    return 0;
+}
+
+my (%map_idx,%map_str);
+@map_idx{(10..35)} = ('a'..'z');
+@map_str{('a'..'z')} = (10..35);
+#打印库表数据明细
+sub pre_dif{
+    my ($tbl_a,$tbl_b) = @_;
+    print "\n";
+    my $sql_a = "select * from $tbl_a where rownum = 1";
+    my $sql_b = "select * from $tbl_b where rownum = 1";
+    my($sth_a,$sth_b);
+    eval{
+        $sth_a = $dbh->prepare($sql_a);
+        $sth_b = $dbh->prepare($sql_b);
+        $sth_a->execute();
+        $sth_b->execute();
+    };
+    print "$@" and return -1 if $@;
+    my @cola = @{$sth_a->{NAME}};
+    my @colb = @{$sth_b->{NAME}};
+    my @linea = $sth_a->fetchrow_array();
+    my @lineb = $sth_b->fetchrow_array();
+    my $colb_num = @lineb;
+    my(%rowa,%rowb);
+    @rowa{@cola} = @linea;
+    @rowb{@colb} = @lineb;
+    my ($cola_s,$colb_s,$cola_vs);
+    map{$cola_s = length($_) if length($_) > $cola_s} @cola;
+    map{$colb_s = length($_) if length($_) > $colb_s} @colb;
+    map{$cola_vs = length($rowa{$_}) if length($rowa{$_}) > $cola_vs} keys %rowa;
+    $cola_s += 4;
+    $colb_s += 4;
+    for(0..$#cola){
+        my $idx = $_+1 > 9 ? $map_idx{$_+1} : $_+1;
+        my $col1 = $cola[$_] . ' ' . sprintf("%1s",$idx) ;
+        my $col2 = $colb[$_] . ' ' . sprintf("%1s",$idx) ;
+        printf "%${cola_s}s: %-${cola_vs}s|",$col1,$rowa{$cola[$_]};
+        printf "%${colb_s}s: %s",$col2,$rowb{$colb[$_]} if $colb[$_];
+        print "\n";
+    }
+    if($colb_num >  @cola){
+        #my $col_len = $cola_s + $colb_s+ 3;
+        for($#cola+1..$#colb){
+            my $idx = $_+1 > 9 ? $map_idx{$_+1} : $_+1;
+            printf "%${cola_s}s  %-${cola_vs}s|",'','';
+            my $col2 = $colb[$_] . ' ' . sprintf("%1s",$idx) ;
+            #printf "%${col_len}s : %-s\n",$col2,$rowb{$colb[$_]};
+            printf "%${colb_s}s: %s\n",$col2,$rowb{$colb[$_]};
+        }
+    }
+    return($tbl_a,$tbl_b,\@cola,\@colb);    
+}
+
+##获取字段明细
+sub get_cols{
+    my ($tbl,$idx) = @_;
+    my $sql = "select * from $tbl where rownum=1";
+    my $sth;
+    eval{
+        $sth = $dbh->prepare($sql);
+        $sth->execute();
+    };
+    print $@ and return -1 if $@;
+    my @cols = @{$sth->{NAME}};
+    my @get_cols;
+    return join(',',@cols) if $idx eq '*';
+    print "字段列表[$idx]格式有误，请检查..\n" and return -1 if !($idx =~ /(\w\,?)+|\w\.\.\w\,?/ && $idx !~ /0|_/);
+    my @indexs = $idx =~ /\,/ ? split /\,/,$idx : split "",$idx;
+    if($idx =~ /\,/){
+        for(split /\,/,$idx){
+            if(/(\w+)\.\.(\w+)/){
+                my($b,$e) = ($1,$2);
+                $b = $map_str{$b} if $b !~ /\d/;
+                $e = $map_str{$e} if $e !~ /\d/;
+                if($e > $b){
+                    for($b..$e){
+                        push @get_cols,$cols[$_-1];
+                    }
+                }else{
+                    print "字段列表[$idx]格式有误，请检查..\n" and return -1;
+                }
+            }else{
+                $_ = $map_str{$_} if $_ !~ /\d/;
+                push @get_cols,$cols[$_-1];
+            }
+        }
+    }else{
+        my($b,$e,$pre_idx,$flag);
+        for(split '',$idx){
+           $_ = $map_str{$_} if $_ !~ /\d/ && $_ !~ /\./;
+           if(/\./){
+              $b = $pre_idx;
+              $flag = 1;
+           }else{
+              $pre_idx = $_;
+           }
+           if($flag && $_ !~ /\./){
+              $e = $_ ;
+              $flag = 0;
+           }
+           if($b && $e){
+              if($e > $b){
+                  for($b+1 .. $e){
+                      push @get_cols,$cols[$_-1];
+                  }
+              }else{
+                  print "字段列表[$idx]格式有误，请检查..\n" and return -1;
+              }
+              ($b,$e) = (0,0);
+           }else{
+              push @get_cols,$cols[$_-1] if $_ !~ /\./;
+           }
+       }
+   }
+   return join(',',@get_cols);
+}
+
+
+
+#数据差异核对入口函数
+sub diff{
+    if(@_ == 5 || @_ == 3){
+        dif(@_);
+    }elsif(@_ == 2){
+        my($tbl_a,$tbl_b,$col_a_ref,$col_b_ref) = pre_dif(@_);
+        return if $tbl_a == -1;
+        print "\n${tag}请指定比对关键字,AB两表比对字段列表: ";
+        my $input;
+        eval{chomp($input = <STDIN>)};
+        my($index,$columns_a,$columns_b) = split /\s+/,$input,3;
+        print "$@" and return if $@;
+        my ($connect_key,@col_key);
+        print "字段列表[$index]格式有误，请检查..\n" and return -1 if !($index =~ /\w+/ && $index !~ /0|_|\./);
+        for(split "",$index){
+            $_ = $map_str{$_} if $_ !~ /\d/;
+            push @col_key,$col_a_ref->[$_-1];
+        }
+        $connect_key = join(',',@col_key);
+        dif($tbl_a,$tbl_b,$connect_key,$columns_a,$columns_b);
+        $columns_a = '*' if not defined $columns_a;
+        $columns_b = '*' if not defined $columns_b;
+        print "${tag}Exec Command:[diff $tbl_a $tbl_b $connect_key $columns_a $columns_b] done..\n";
+    }
+}
+
+#数据核对主函数
+sub dif{
+    my ($tbl_a,$tbl_b,$key,$idx_a,$idx_b) = @_;
+    print "\n\033[33m${tag}调用数据差异核对分析函数，请稍等..\033[0m\n";
+    $idx_a ||= '*';
+    $idx_b ||= '*';
+    my $fetch_col_a = get_cols($tbl_a,$idx_a);
+    return if $fetch_col_a == -1;
+    my $fetch_col_b = get_cols($tbl_b,$idx_b);
+    return if $fetch_col_b == -1;
+    my @cols = split /\,/,$fetch_col_a;
+    my @id;
+    for my $i(0..$#cols){
+        for(split /\,/,$key){
+            push @id,$i if @cols[$i] eq uc($_);
+        }
+    }
+    my $total_col = @cols;
+    my @cols_b = split /\,/,$fetch_col_b;
+    print "字段个数不匹配,请检查..\n" and return -1 if $total_col != @cols_b;
+    push @cols,'tbl';
+    @cols = map{uc} @cols;
+    $total_col += 1;
+    $key = uc($key);
+    #核对无误的数据量
+    my($cnt_sql,$cnt_sql1,$cnt_sql2);
+    if(@id > 1){
+        my @tmp;
+        push @tmp ,$cols_b[$_] for @id; 
+        my $column = join(',',@tmp);
+        $cnt_sql1 = qq{select 'A' tbl,count(1) total from $tbl_a union all select 'B' tbl,count(1) total from $tbl_b};
+        $cnt_sql2 = qq{select 'A' tbl,count(1) total from (select distinct $key from $tbl_a) union all select 'B',count(1) total from (select distinct $column from $tbl_b)};
+    }else{
+        $cnt_sql = qq{select 'A' tbl,count(1) total,count(distinct $key) total2 from $tbl_a union all select 'B',count(1) total,count(distinct $key) total2 from $tbl_b};
+    }
+    my(%total,$cnt_sth,$cnt1_sth,$cnt2_sth);
+    eval{
+    if($cnt_sql){
+        $cnt_sth = $dbh->prepare($cnt_sql);
+        $cnt_sth->execute();
+        while(my @line = $cnt_sth->fetchrow_array()){
+            $total{$line[0]} = [$line[1],$line[2]];
+        }
+    }else{
+        $cnt1_sth = $dbh->prepare($cnt_sql1);
+        $cnt1_sth->execute();
+        while(my @line = $cnt1_sth->fetchrow_array()){
+            $total{$line[0]}[0] = $line[1];
+        }
+        $cnt2_sth = $dbh->prepare($cnt_sql2);
+        $cnt2_sth->execute();
+        while(my @line = $cnt2_sth->fetchrow_array()){
+            $total{$line[0]}[1] = $line[1];
+        }
+    }};
+    print $@ and return if $@;
+    my $common_sql = qq{select count(*) cnt from (select $fetch_col_a from $tbl_a intersect select $fetch_col_b from $tbl_b)};
+    my $diff_sql = qq{select $fetch_col_a,'A' tbl from $tbl_a minus select $fetch_col_b,'A' tbl from $tbl_b
+                      union all
+                      select $fetch_col_b,'B' tbl from $tbl_b minus select $fetch_col_a,'B' tbl from $tbl_a 
+                      order by $total_col asc};
+    #print "diff_sql:$diff_sql\n";
+    my($common_sth,$diff_sth,@result,$cnt);
+    eval{
+        @result = $dbh->selectrow_array($common_sql);
+        $diff_sth = $dbh->prepare($diff_sql);
+        $diff_sth->execute();
+    };
+    print $@ and return if $@;
+    print "\n\033[1m+-------------------Report:数据核对分析结果报告-------------------+\033[0m\n";
+    print "→A:$tbl_a B:$tbl_b key:$key\n\n";
+    print "☉核对字段列表:",join('|',map{lc} @cols),"\n";
+    my $flag1 = $total{'A'}[0] == $total{'B'}[0] && $total{'A'}[1] == $total{'B'}[1] ? '√' : $warn;
+    print "→1.数据量核对结果   ($flag1): A->$total{'A'}[0] 去重:$total{'A'}[1]  B->$total{'B'}[0] 去重:$total{'B'}[1] 去重指按关键字去重统计\n";
+    #print "→1.数据量核对结果   ($flag1): A->$total{'A'} B->$total{'B'}\n";
+    print $@ and return -1 if $@;
+    $cnt = $result[0];
+
+    my (%row,$only_a,$only_b,%cnta,%cntb,%dupa,%dupb,%onlya,%onlyb,%diff_val,%diff_cnt);
+    $diff_sth->bind_columns( \(@row{@cols}) );
+    my @col_key = split /\,/,$key;
+    while($diff_sth->fetch){
+        if($interrupt){$diff_sth->finish;$interrupt=0;return -2};
+        my @keys = map{$row{$_}} @col_key;
+        my $key = join('^',@keys);
+        if($row{'TBL'} eq 'A'){
+            $only_a++;
+            if(++$cnta{$key} == 1){
+                $onlya{$key} = {%row};
+            }else{
+                $dupa{$key} = 1;
+                my $newkey = $key . '^' . $cnta{$key};
+                $onlya{$newkey} = {%row};
+            }
+        }else{
+            $only_b++;
+            if(++$cntb{$key} == 1){
+                $onlyb{$key} = {%row};
+                if($onlya{$key} && !$dupa{$key}){ #开始数据核对
+                    for my $col(@cols){
+                        next if $col eq 'TBL';
+                        $onlya{$key}->{$col} ||= 'null';
+                        $row{$col} ||= 'null';
+                        if($onlya{$key}->{$col} ne $row{$col}){
+                            $diff_cnt{$col}++;
+                            $diff_val{$key}{$col} = $onlya{$key}->{$col} . ' <> ' . $row{$col};
+                        }
+                    }
+                }
+            }else{
+                $dupb{$key} = 1;
+                delete $diff_val{$key} if $diff_val{$key};
+                my $newkey = $key . '^' . $cntb{$key};
+                $onlyb{$newkey} = {%row};
+            }
+        }
+    }
+    #仅B存在且重复的数据不要加入统计明细
+    for(keys %dupb){
+        for(keys %{$diff_val{$_}}){
+            $diff_cnt{$_}--;
+        }
+    }
+    
+    #定义打印明细数据条数，其余数据均写入文件
+    my $pnum = 10;
+    #打印核对明细(记录级) 
+    $only_a ||= 0 ;
+    $only_b ||= 0 ;
+    my $flag2 = !($only_a || $only_b) ? '√' : $warn;
+    print "→2.记录级核对结果   ($flag2): 匹配记录数: $cnt 仅A有记录数: $only_a 仅B有记录数: $only_b\n";
+       
+    #打印核对明细(字段级)
+    my $diff_cnt3 = keys %diff_val;
+    $diff_cnt3 ||= 0;
+    my $flag3 = !$diff_cnt3 ? '√' : $warn;
+    print "→3.字段级核实结果   ($flag3): 共[ $diff_cnt3 ]条差异数据 注:以关键字[$key]两表连接,对应字段数据逐个核实对\n";
+    
+    #重复数据打印
+    my $acnt = keys %dupa;
+    my $bcnt = keys %dupb;
+    my $total_dup = $acnt + $bcnt;
+    $total_dup ||= 0;
+    my $flag4 = !$total_dup ? '√' : $warn;
+    print "→4.反交集重复核实   ($flag4): 共[ $total_dup ]条重复数据 注:指反交集结果集中关键字[$key]的重复数据量\n";
+    
+    print "\n" if $flag2 ne '√' || $diff_cnt3 || $total_dup;
+    
+    if($flag2 ne '√'){
+        my $info = $only_a && $only_b ? "仅A[only_a] 仅B[only_b]" : ($only_a ? "仅A[only_a]" : "仅B[only_b]");
+        print "\033[1;4m${tag}记录级明细差异文件目录[$ENV{HOME}] 文件名:$info\033[0m\n\n";
+        my($i,$j);
+        print "字段列表:",join('|',map{lc} @cols),"\n";
+        if($only_a){
+            open my $fha,">$ENV{HOME}/only_a";
+            print "${tag}仅A有记录明细,仅显示前10行,小于10行则全部显示\n";
+            for(sort keys %onlya){
+                print $fha join('|',@{$onlya{$_}}{@cols}),"\n";
+                print join('|',@{$onlya{$_}}{@cols}),"\n" if ++$i <= $pnum;
+            }
+        }
+        print "\n";
+        if($only_b){
+            open my $fhb,">$ENV{HOME}/only_b";
+            print "${tag}仅B有记录明细,仅显示前10行,小于10行则全部显示\n";
+            for(sort keys %onlyb){
+                print $fhb join('|',@{$onlyb{$_}}{@cols}),"\n";
+                print join('|',@{$onlyb{$_}}{@cols}),"\n" if ++$j <= $pnum;
+            }
+        }
+    }
+    
+    if($diff_cnt3){
+        print "\n\033[1;4m${tag}字段级核对差异明细统计结果 格式->[字段: 差异记录数]\033[0m\n\n";
+        for(sort {$diff_cnt{$b} <=> $diff_cnt{$a}} keys %diff_cnt){
+            print "$_: $diff_cnt{$_}|";
+        }
+        print "\n";
+    
+        #每种情况打印前5条明细
+        print "\n\033[1;4m${tag}字段级核对差异数据明细见文件:$ENV{HOME}/diff_col,仅显示前5个号码 格式[关键字→ 字段:A值 <> B值]\033[0m\n";
+        open my $fh,">$ENV{HOME}/diff_col";
+        my $k;
+        for my $key(sort keys %diff_val){
+            print $fh "$key${tag}";
+            print "$key${tag}" if ++$k < 6;
+            for(sort keys %{$diff_val{$key}}){
+                print $fh " $_:$diff_val{$key}{$_}";
+                print " $_:$diff_val{$key}{$_}" if $k < 6;
+            }
+            print $fh "\n";print "\n" if $k<6;
+        }
+    }
+    
+    if($total_dup){
+        open my $dup,">$ENV{HOME}/diff_dup";
+        my($m,$n);
+        print "\n\033[1;4m${tag}反交集重复数据明细见文件:$ENV{HOME}/diff_dup,共 $total_dup 条重复数据,默认打印前8条记录重复明细\033[0m\n";
+        for(sort keys %dupa){
+            print $dup "A|",join('|',@{$onlya{$_}}{@cols}),"\n";
+            print join('|',@{$onlya{$_}}{@cols}),"\n" if ++$m <= 4;
+        }
+        for(sort keys %dupb){
+            print $dup "B|",join('|',@{$onlyb{$_}}{@cols}),"\n";
+            print join('|',@{$onlyb{$_}}{@cols}),"\n" if ++$n <= 4;
+        }
+        
+    }
+    print "\n";
+}
+
+
+#程序入口
+sub main{
+    my $tmp_dbh = init_conn($ARGV[0]);
+    if($tmp_dbh == -1){
+        print "${dbi_driver}登录失败,请检查配置文件【$cfg_file】是否有误..!\n" and exit -1;
+    }else{
+        if($diff_flag){
+            print "\n${dbi_driver}登录成功,是否保存当前用户[$user]配置(yes/no)? ";
+            chomp(my $input = <STDIN>);
+            modify_cfg($cfg_file,$user,$de_passwd) if $input =~ /\s*y/i;
+        }else{
+            print "\n→提醒:您正使用个性化配置文件[$cfg_file]认证登录,帐号/密码如有变更请vi编辑.\n";
+        }
+        $all_dbh{$sid}{$user} = $tmp_dbh;
+        $dbh = $all_dbh{$sid}{$user};
+    }
+    $init_db{'ora'}->($dbh);
+    welcome();
+    call_dbi();
+}
+
+main();
+
+
+END{
+    dbrollback($dbh,'end');
+    dblog($logfh,"Rollback for the end!");
+    for(keys %pre_sth){
+        $pre_sth{$_}->finish if $pre_sth{$_};
+    }
+    for my $s(keys %all_dbh){
+        for(keys %{$all_dbh{$s}}){
+            $all_dbh{$s}{$_}->disconnect;
+        }
+    }
+    $dbh->disconnect if $dbh;
+    my $days = 7;
+    my $cmd = qq{find $log_dir -type f -ctime +$days |grep $tool_name|egrep -v 'gz|Z|conn\$'|xargs gzip -f 2>/dev/null 1>&2};
+    eval{system($cmd);};
+    $@ ? dblog($logfh,"压缩[ $days ]天前日志文件失败..",'W') :dblog($logfh,"压缩[ $days ]天前日志文件完成..");
+}
