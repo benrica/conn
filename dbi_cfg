@@ -18,12 +18,12 @@ brush_num=100
 driver=Oracle
 sid=ORCL
 user=student
-passwd=u6Z9gXjYw==
+passwd=
 parallel=
 
 [STUDENT]
 driver=Oracle
 sid=orcl
 user=student
-passwd=u6Z9gXjYw==
+passwd=
 parallel=
